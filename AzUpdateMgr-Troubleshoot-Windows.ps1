@@ -279,19 +279,102 @@ Invoke-Safe 'Installed hotfixes (last set)' {
         Format-Table -AutoSize
 }
 
-# 7. Reboot pending check (registry only, no reboot) --------------------------
+# 7. Reboot pending check (registry / WMI only, no reboot) -------------------
 Invoke-Safe 'Pending reboot flags' {
-    $checks = @{
-        'Component Based Servicing' = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
-        'Windows Update AU'         = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-        'PendingFileRenameOps'      = [bool](Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue)
-        'Pending computer rename'   = ((Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName -ErrorAction SilentlyContinue).ComputerName -ne
-                                       (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -Name ComputerName -ErrorAction SilentlyContinue).ComputerName)
+    # Gather every signal Windows exposes; capture the *evidence* for each hit
+    # so we can tell the caller *why* the machine believes a reboot is due.
+    $details = [ordered]@{}
+
+    # 1. Component Based Servicing (CBS) - main servicing engine
+    $cbsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+    if (Test-Path $cbsKey) {
+        # The subkeys under it are the KBs / component packages waiting
+        $pkgs = @(Get-ChildItem $cbsKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+        $details['CBS RebootPending']       = if ($pkgs) { "packages waiting: $($pkgs -join ', ')" } else { 'key present (no sub-keys enumerated)' }
     }
-    $checks.GetEnumerator() | ForEach-Object {
-        [pscustomobject]@{ Check = $_.Key; Pending = [bool]$_.Value }
-    } | Format-Table -AutoSize
-    $summary.RebootPending = ($checks.Values | Where-Object { $_ }) -ne $null
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending') {
+        $pending = @(Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\PackagesPending' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+        if ($pending) { $details['CBS PackagesPending'] = "$($pending.Count) package(s): $(($pending | Select-Object -First 5) -join ', ')$(if($pending.Count -gt 5){' ...'})" }
+    }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootInProgress') {
+        $details['CBS RebootInProgress'] = 'key present (an install is mid-flight)'
+    }
+
+    # 2. Windows Update Auto Update - classic "reboot required" flag
+    $wuKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    if (Test-Path $wuKey) {
+        $svc = @(Get-ChildItem $wuKey -ErrorAction SilentlyContinue | Select-Object -ExpandProperty PSChildName)
+        $details['Windows Update RebootRequired'] = if ($svc) { "waiting service(s): $($svc -join ', ')" } else { 'key present' }
+    }
+    # PostRebootReporting - Windows Update finished install but hasn't booted yet
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\PostRebootReporting') {
+        $details['WU PostRebootReporting'] = 'update installed, awaiting first boot to report'
+    }
+
+    # 3. Pending file rename operations - anything trying to replace a locked file at next boot
+    $pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pfro -and $pfro.PendingFileRenameOperations) {
+        # entries alternate: source, destination (may be empty = delete)
+        $entries = @($pfro.PendingFileRenameOperations | Where-Object { $_ })
+        $preview = $entries | Select-Object -First 4
+        $details['PendingFileRenameOperations'] = "$($entries.Count) entr(y|ies), e.g. $(($preview -join '; '))$(if($entries.Count -gt 4){' ...'})"
+    }
+    if (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations2 -ErrorAction SilentlyContinue) {
+        $details['PendingFileRenameOperations2'] = 'secondary rename queue present'
+    }
+
+    # 4. Domain / computer rename pending
+    $active = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
+    $target = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName'       -Name ComputerName -ErrorAction SilentlyContinue).ComputerName
+    if ($active -and $target -and ($active -ne $target)) {
+        $details['Pending computer rename'] = "active='$active' -> target='$target'"
+    }
+    if (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name JoinDomain -ErrorAction SilentlyContinue) {
+        $details['Pending domain join'] = 'Netlogon\JoinDomain value present'
+    }
+    if (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\Netlogon' -Name AvoidSpnSet -ErrorAction SilentlyContinue) {
+        $details['Pending domain join'] = ($details['Pending domain join'] + '; Netlogon\AvoidSpnSet present').TrimStart('; ')
+    }
+
+    # 5. Windows Update client via COM (authoritative "is a reboot required?" answer)
+    try {
+        $sysInfo = New-Object -ComObject Microsoft.Update.SystemInfo
+        if ($sysInfo.RebootRequired) {
+            $details['Microsoft.Update.SystemInfo'] = 'RebootRequired = True (COM API)'
+        }
+    } catch {
+        # COM not available, ignore
+    }
+
+    # 6. Configuration Manager / SCCM client, if installed
+    try {
+        $ccm = Invoke-CimMethod -Namespace 'ROOT\ccm\ClientSDK' -ClassName 'CCM_ClientUtilities' `
+                    -MethodName 'DetermineIfRebootPending' -ErrorAction Stop
+        if ($ccm -and ($ccm.RebootPending -or $ccm.IsHardRebootPending)) {
+            $details['SCCM/CCM client'] = "RebootPending=$($ccm.RebootPending), IsHardRebootPending=$($ccm.IsHardRebootPending)"
+        }
+    } catch {
+        # Namespace absent = SCCM client not installed. Silent.
+    }
+
+    # 7. servermanagercmd / DISM staged for reboot
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\ServerManager\CurrentRebootAttempts') {
+        $details['Server Manager']  = 'CurrentRebootAttempts key present'
+    }
+
+    # Emit a readable table + populate summary
+    if ($details.Count -gt 0) {
+        $details.GetEnumerator() | ForEach-Object {
+            [pscustomobject]@{ Signal = $_.Key; Evidence = $_.Value }
+        } | Format-Table -AutoSize -Wrap
+    } else {
+        "  <no pending-reboot signals detected>"
+    }
+
+    $summary.RebootPending        = [bool]($details.Count -gt 0)
+    $summary.RebootPendingReasons = @($details.GetEnumerator() | ForEach-Object {
+        [pscustomobject]@{ Signal = $_.Key; Evidence = $_.Value }
+    })
 }
 
 # 8. Disk space (system drive + all fixed) -----------------------------------
@@ -440,8 +523,10 @@ $localJson    = "C:\Temp\$jsonLeaf"
 # double quotes to escape. Inner script (run on the VM) uses single quotes
 # around the path so the outer double-quoted -ScriptString works cleanly.
 $q = [char]34   # literal double-quote, keeps this line free of escaping headaches
-$fetchLog  = "(Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$logPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localLog' -Encoding UTF8"
-$fetchJson = "(Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$jsonPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localJson' -Encoding UTF8"
+# The one-liners create C:\Temp on the LOCAL PC first (Set-Content does not
+# auto-create parent directories), then invoke Run Command and save the output.
+$fetchLog  = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$logPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localLog' -Encoding UTF8"
+$fetchJson = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$jsonPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localJson' -Encoding UTF8"
 
 $compact = @"
 === Azure Update Manager diag (Windows) ===
@@ -450,7 +535,9 @@ Started (UTC)    : $($startedUtc.ToString('s'))Z
 Finished (UTC)   : $($summary.FinishedUtc)
 Log file         : $logPath  ($([math]::Round($logSize/1KB,1)) KB)
 Summary JSON     : $jsonPath
-Reboot pending?  : $($summary.RebootPending)
+Reboot pending?  : $($summary.RebootPending)$(if ($summary.RebootPending -and $summary.RebootPendingReasons) {
+    "`r`n  Reasons        :`r`n" + (($summary.RebootPendingReasons | ForEach-Object { "    - $($_.Signal): $($_.Evidence)" }) -join "`r`n")
+})
 Free on C:       : $($summary.SystemDriveFreeGB) GB
 VM Resource ID   : $($summary.ResourceId)
 Detected VM/RG   : $vmNameForCmd  /  $rgForCmd
@@ -458,9 +545,8 @@ Warnings         : $($summary.Warnings.Count)
 Errors captured  : $($summary.Errors.Count)
 
 --- Retrieve from your local PowerShell (Az module) ---
-Prereqs on your local PC:
-    Connect-AzAccount
-    New-Item -ItemType Directory -Force -Path C:\Temp | Out-Null
+Prereq (once per session):  Connect-AzAccount
+(C:\Temp is created automatically by the one-liners below.)
 
 # Full log:
 $fetchLog
