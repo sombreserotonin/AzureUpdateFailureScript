@@ -75,9 +75,12 @@ function Invoke-Safe {
     Write-Section $Name
     Write-Log "BEGIN: $Name"
     try {
-        $out = & $Script 2>&1
+        # *>&1 merges every stream (errors, warnings, information) so nothing
+        # bypasses the log; -Width stops Out-String truncating wide tables at
+        # the host buffer (~120 chars), which silently dropped column data.
+        $out = & $Script *>&1
         if ($null -ne $out) {
-            $text = ($out | Out-String).TrimEnd()
+            $text = ($out | Out-String -Width 4096).TrimEnd()
             if ($text) { Add-Content -LiteralPath $logPath -Value $text -Encoding UTF8 }
         }
     } catch {
@@ -93,8 +96,16 @@ function Get-TailFile {
     if (-not (Test-Path -LiteralPath $Path)) { return "  <not found: $Path>" }
     try {
         $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($item.PSIsContainer) {
+            # A directory was passed (e.g. C:\WindowsAzure\Logs\AggregateStatus).
+            # Tail the most recently modified file inside it instead of failing.
+            $newest = Get-ChildItem -LiteralPath $Path -File -ErrorAction Stop |
+                      Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $newest) { return "  <directory contains no files: $Path>" }
+            $item = $newest
+        }
         $header = "  >> $($item.FullName)  ($([math]::Round($item.Length/1KB,1)) KB, modified $($item.LastWriteTime.ToString('s')))"
-        $tail = Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction Stop
+        $tail = Get-Content -LiteralPath $item.FullName -Tail $Lines -ErrorAction Stop
         return @($header, '  ---- tail begin ----') + ($tail | ForEach-Object { '  ' + $_ }) + '  ---- tail end ----'
     } catch {
         return "  <cannot read '$Path': $($_.Exception.Message)>"
@@ -166,10 +177,12 @@ Invoke-Safe 'Update Manager extensions on disk' {
         'Microsoft.CPlat.Core.RunCommandWindows'
     )
     foreach ($ext in $wanted) {
-        $matches = Get-ChildItem $pluginRoot -Directory -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -like "$ext*" }
-        if (-not $matches) { "  <not installed: $ext>"; continue }
-        foreach ($m in $matches) {
+        # NB: do not name this $matches - that clobbers the automatic $Matches
+        # variable and can be silently overwritten by any later -match operator.
+        $extMatches = Get-ChildItem $pluginRoot -Directory -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -like "$ext*" }
+        if (-not $extMatches) { "  <not installed: $ext>"; continue }
+        foreach ($m in $extMatches) {
             "  {0}   (modified {1})" -f $m.FullName, $m.LastWriteTime
             $statusDir = Join-Path $m.FullName 'Status'
             if (Test-Path $statusDir) {
@@ -236,6 +249,117 @@ Invoke-Safe 'Windows Update / WSUS registry policy' {
                 Select-Object * -ExcludeProperty PS* | Format-List
         } else { "  <key not present>" }
     }
+}
+
+# 5a. WSUS client configuration (UseWUServer / WUServer / WUStatusServer) -----
+Invoke-Safe 'WSUS client configuration' {
+    $policyKey   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'
+    $policyAuKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU'
+
+    $wuServer       = (Get-ItemProperty -Path $policyKey   -Name WUServer       -ErrorAction SilentlyContinue).WUServer
+    $wuStatusServer = (Get-ItemProperty -Path $policyKey   -Name WUStatusServer -ErrorAction SilentlyContinue).WUStatusServer
+    $useWUServer    = (Get-ItemProperty -Path $policyAuKey -Name UseWUServer    -ErrorAction SilentlyContinue).UseWUServer
+
+    [pscustomobject]@{
+        UseWUServer    = if ($null -ne $useWUServer) { $useWUServer } else { '<not set>' }
+        WUServer       = if ($wuServer)              { $wuServer }    else { '<not set>' }
+        WUStatusServer = if ($wuStatusServer)        { $wuStatusServer } else { '<not set>' }
+    } | Format-List
+
+    $wsusConfigured = ($useWUServer -eq 1) -and -not [string]::IsNullOrWhiteSpace($wuServer)
+    if ($wsusConfigured) {
+        "WSUS is configured: this client is managed by $wuServer"
+    } else {
+        "WSUS is NOT configured: this client uses Microsoft Update directly."
+    }
+
+    $summary.WsusConfigured   = $wsusConfigured
+    $summary.WsusUseWUServer  = $useWUServer
+    $summary.WsusServer       = $wuServer
+    $summary.WsusStatusServer = $wuStatusServer
+}
+
+# 5b. WSUS client registration (SusClientId / PingID) --------------------------
+Invoke-Safe 'WSUS client registration (SusClientId)' {
+    $idKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate'
+    $props = Get-ItemProperty -Path $idKey -ErrorAction SilentlyContinue
+    $susClientId = $props.SusClientId
+    $pingId      = $props.PingID
+
+    [pscustomobject]@{
+        SusClientId = if ($susClientId) { $susClientId } else { '<missing>' }
+        PingID      = if ($pingId)      { $pingId }      else { '<not present>' }
+    } | Format-List
+
+    $summary.SusClientId = $susClientId
+    $summary.PingID      = $pingId
+    if ([string]::IsNullOrWhiteSpace($susClientId)) {
+        $summary.Warnings.Add('SusClientId is missing or empty - this client may not be registered with WSUS.') | Out-Null
+    }
+}
+
+# 5c. Last successful update detection -----------------------------------------
+Invoke-Safe 'Last successful update detection' {
+    $detectKey = 'HKLM:\Software\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\Results\Detect'
+    $lastSuccess = (Get-ItemProperty -Path $detectKey -Name LastSuccessTime -ErrorAction SilentlyContinue).LastSuccessTime
+    if ($lastSuccess) {
+        "LastSuccessTime (detection): $lastSuccess"
+        $summary.LastDetectSuccessTime = $lastSuccess
+    } else {
+        "  <no LastSuccessTime recorded under $detectKey>"
+        $summary.LastDetectSuccessTime = $null
+        $summary.Warnings.Add('No Windows Update detection LastSuccessTime found - the client may never have completed a scan.') | Out-Null
+    }
+}
+
+# 5d. WSUS web service health (supplements the Test-NetConnection checks) ------
+Invoke-Safe 'WSUS web service health (ClientWebService)' {
+    if (-not $summary.WsusConfigured -or [string]::IsNullOrWhiteSpace($summary.WsusServer)) {
+        "  <WSUS not configured - skipping web service check>"
+        return
+    }
+    $wsusUri = "$($summary.WsusServer.TrimEnd('/'))/ClientWebService/client.asmx"
+    "Testing HTTP reachability of: $wsusUri"
+
+    $result = [ordered]@{
+        Uri            = $wsusUri
+        HttpStatusCode = $null
+        Responded      = $false
+        Error          = $null
+    }
+    try {
+        $resp = Invoke-WebRequest -Uri $wsusUri -UseBasicParsing -Method Get `
+                    -TimeoutSec $PerCommandTimeoutSec -ErrorAction Stop
+        $result.HttpStatusCode = [int]$resp.StatusCode
+        $result.Responded      = $true
+    } catch [System.Net.WebException] {
+        $webResp = $_.Exception.Response
+        if ($webResp) {
+            # Server answered, just with a non-success code (e.g. 403/500).
+            $result.HttpStatusCode = [int]$webResp.StatusCode
+            $result.Responded      = $true
+        }
+        $result.Error = $_.Exception.Message
+    } catch {
+        # Covers SSL/TLS handshake failures, DNS errors, timeouts, etc.
+        $result.Error = $_.Exception.Message
+    }
+    [pscustomobject]$result | Format-List
+
+    # TCP-level check against the WSUS host/port, mirroring the endpoint checks
+    # in the connectivity section (supplement, not a replacement).
+    try {
+        $u = [uri]$wsusUri
+        $tnc = Test-NetConnection -ComputerName $u.Host -Port $u.Port -InformationLevel Quiet -WarningAction SilentlyContinue
+        "Test-NetConnection $($u.Host):$($u.Port) -> $tnc"
+    } catch {
+        "Test-NetConnection failed: $($_.Exception.Message)"
+    }
+
+    if (-not $result.Responded) {
+        $summary.Warnings.Add("WSUS ClientWebService did not respond at $wsusUri : $($result.Error)") | Out-Null
+    }
+    $summary.WsusWebService = [pscustomobject]$result
 }
 
 # 6. Windows Update client health via COM (read-only, no scan triggered) -----
@@ -362,6 +486,19 @@ Invoke-Safe 'Pending reboot flags' {
         $details['Server Manager']  = 'CurrentRebootAttempts key present'
     }
 
+    # Explicit per-indicator booleans so it is immediately obvious *which*
+    # signal is driving RebootPending, not just that one exists.
+    $indicators = [ordered]@{
+        ComponentBasedServicing     = [bool](Test-Path $cbsKey)
+        WindowsUpdateRebootRequired = [bool](Test-Path $wuKey)
+        PendingFileRenameOperations = [bool]($pfro -and $pfro.PendingFileRenameOperations)
+        PendingComputerRename       = [bool]($active -and $target -and ($active -ne $target))
+    }
+    "---- Individual reboot indicators ----"
+    $indicators.GetEnumerator() | ForEach-Object {
+        [pscustomobject]@{ Indicator = $_.Key; Pending = $_.Value }
+    } | Format-Table -AutoSize
+
     # Emit a readable table + populate summary
     if ($details.Count -gt 0) {
         $details.GetEnumerator() | ForEach-Object {
@@ -371,10 +508,11 @@ Invoke-Safe 'Pending reboot flags' {
         "  <no pending-reboot signals detected>"
     }
 
-    $summary.RebootPending        = [bool]($details.Count -gt 0)
-    $summary.RebootPendingReasons = @($details.GetEnumerator() | ForEach-Object {
+    $summary.RebootPending           = [bool]($details.Count -gt 0)
+    $summary.RebootPendingReasons    = @($details.GetEnumerator() | ForEach-Object {
         [pscustomobject]@{ Signal = $_.Key; Evidence = $_.Value }
     })
+    $summary.RebootPendingIndicators = [pscustomobject]$indicators
 }
 
 # 8. Disk space (system drive + all fixed) -----------------------------------
@@ -505,7 +643,11 @@ Invoke-Safe 'Guest patch settings (from IMDS)' {
 # --- Summary block -----------------------------------------------------------
 Write-Section 'Summary'
 $summary.FinishedUtc = (Get-Date).ToUniversalTime().ToString('o')
-$summary | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+$summaryJsonText = $summary | ConvertTo-Json -Depth 6
+$summaryJsonText | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+# Mirror the summary into the log file too - previously the 'Summary' section
+# header was written but no content ever followed it in the log.
+Add-Content -LiteralPath $logPath -Value $summaryJsonText -Encoding UTF8
 
 $logSize = (Get-Item $logPath).Length
 
@@ -541,7 +683,9 @@ Reboot pending?  : $($summary.RebootPending)$(if ($summary.RebootPending -and $s
 Free on C:       : $($summary.SystemDriveFreeGB) GB
 VM Resource ID   : $($summary.ResourceId)
 Detected VM/RG   : $vmNameForCmd  /  $rgForCmd
-Warnings         : $($summary.Warnings.Count)
+Warnings         : $($summary.Warnings.Count)$(if ($summary.Warnings.Count -gt 0) {
+    "`r`n" + (($summary.Warnings | ForEach-Object { "    - $_" }) -join "`r`n")
+})
 Errors captured  : $($summary.Errors.Count)
 
 --- Retrieve from your local PowerShell (Az module) ---
