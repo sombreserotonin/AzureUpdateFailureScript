@@ -14,23 +14,26 @@
 #    * A JSON summary is written next to the log.
 #    * Only a short SUMMARY is printed to stdout, because Azure Run Command
 #      truncates stdout to ~4 KB. Pull the full log off the VM afterwards.
-#    * Every command is wrapped with a timeout so a single hung tool cannot
-#      block the run.
+#    * Every external tool invocation is wrapped with a timeout so a single
+#      hung tool cannot block the run.
 #    * `set -e` is deliberately NOT used; we want partial data even when
 #      individual checks fail.
 #
+#  Version        : 1.0.0
 #  Tested against : Ubuntu 18.04/20.04/22.04/24.04, RHEL/CentOS/Rocky/Alma
 #                   7/8/9, SLES 12/15, Debian 10/11/12, Oracle Linux 7/8/9,
 #                   Azure Linux (CBL-Mariner) 2/3.
 # =============================================================================
 
 # ---- config -----------------------------------------------------------------
+SCRIPT_VERSION="1.0.0"
 TAIL_LINES="${TAIL_LINES:-200}"
 CMD_TIMEOUT="${CMD_TIMEOUT:-45}"          # per external command (seconds)
 RECENT_COUNT="${RECENT_COUNT:-25}"        # recent updates / history entries
 NET_TIMEOUT="${NET_TIMEOUT:-5}"
 
 TS="$(date -u +%Y%m%d-%H%M%SZ)"
+START_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 OUT_DIR="/var/log"
 if [ ! -w "$OUT_DIR" ]; then OUT_DIR="/tmp"; fi
 LOG="$OUT_DIR/azupdatemgr-diag-$TS.log"
@@ -53,16 +56,19 @@ run_safe() {
     [ "$1" = "--" ] && shift
     section "$title"
     log "BEGIN: $title"
+    local rc=0
     if command -v timeout >/dev/null 2>&1; then
         timeout --preserve-status "${CMD_TIMEOUT}s" "$@" >>"$LOG" 2>&1
-        local rc=$?
+        rc=$?
     else
         "$@" >>"$LOG" 2>&1
-        local rc=$?
+        rc=$?
     fi
     if [ $rc -ne 0 ]; then
         log "END:   $title (rc=$rc)" "WARN"
         WARN_COUNT=$((WARN_COUNT+1))
+        # rc >= 126 is a command-not-found / exec failure — treat as error
+        if [ $rc -ge 126 ]; then ERR_COUNT=$((ERR_COUNT+1)); fi
     else
         log "END:   $title"
     fi
@@ -74,12 +80,22 @@ run_sh() {
     local title="$1"; local snippet="$2"
     section "$title"
     log "BEGIN: $title"
+    local rc=0
     if command -v timeout >/dev/null 2>&1; then
         timeout --preserve-status "${CMD_TIMEOUT}s" sh -c "$snippet" >>"$LOG" 2>&1
+        rc=$?
     else
         sh -c "$snippet" >>"$LOG" 2>&1
+        rc=$?
     fi
-    log "END:   $title"
+    if [ $rc -ne 0 ]; then
+        log "END:   $title (rc=$rc)" "WARN"
+        WARN_COUNT=$((WARN_COUNT+1))
+        # rc >= 126 is a command-not-found / exec failure — treat as error
+        if [ $rc -ge 126 ]; then ERR_COUNT=$((ERR_COUNT+1)); fi
+    else
+        log "END:   $title"
+    fi
     return 0
 }
 
@@ -100,6 +116,7 @@ tail_file() {
 mkdir -p "$OUT_DIR" 2>/dev/null || true
 : > "$LOG"
 section "Azure Update Manager - Linux diagnostic"
+log "Script version: $SCRIPT_VERSION"
 log "Script started on $(hostname) as $(id -un) (uid=$(id -u))"
 log "Read-only mode. No changes will be made to this VM."
 log "Log file: $LOG"
@@ -114,6 +131,7 @@ run_sh "OS identity" '
     uptime
     echo "---- date (UTC) ----"
     date -u
+    true
 '
 
 if [ -r /etc/os-release ]; then
@@ -143,6 +161,7 @@ run_sh "Azure Instance Metadata (IMDS)" "
     else
         echo 'curl not present, skipping IMDS'
     fi
+    true
 "
 
 VM_RESOURCE_ID=""
@@ -163,6 +182,7 @@ run_sh "Azure Linux agent (waagent)" '
     done
     echo "---- /var/lib/waagent (top level) ----"
     ls -la /var/lib/waagent 2>/dev/null | head -n 60 || echo "  <missing>"
+    true
 '
 
 run_sh "Azure Arc agent (if present)" '
@@ -173,6 +193,7 @@ run_sh "Azure Arc agent (if present)" '
     else
         echo "azcmagent not installed (not an Azure Arc-enabled machine)"
     fi
+    true
 '
 
 # ---- 4. Update Manager Linux patch extension --------------------------------
@@ -184,6 +205,7 @@ run_sh "LinuxPatchExtension - installed versions" '
     else
         echo "  <no /var/lib/waagent>"
     fi
+    true
 '
 
 section "LinuxPatchExtension - status files (latest per version)"
@@ -193,13 +215,11 @@ for extdir in /var/lib/waagent/Microsoft.CPlat.Core.LinuxPatchExtension-*/status
     echo "  ---- $extdir ----" >> "$LOG"
     ls -lt "$extdir" 2>/dev/null | head -n 5 >> "$LOG"
     # cat the newest 2 status files
-    latest=$(ls -1t "$extdir"/*.status 2>/dev/null | head -n 2)
-    for f in $latest; do
+    ls -1t "$extdir"/*.status 2>/dev/null | head -n 2 | while read -r f; do
         echo "  ==== $f ====" >> "$LOG"
         # Pretty-print if python3 available, else raw
         if command -v python3 >/dev/null 2>&1; then
-            python3 -c "import json,sys; print(json.dumps(json.load(open('$f')), indent=2))" \
-                >>"$LOG" 2>>"$LOG" || cat "$f" >>"$LOG"
+            python3 -m json.tool "$f" >>"$LOG" 2>>"$LOG" || cat "$f" >>"$LOG"
         else
             cat "$f" >>"$LOG"
         fi
@@ -209,9 +229,9 @@ done
 section "LinuxPatchExtension - operational logs"
 LOG_ROOT=/var/log/azure/Microsoft.CPlat.Core.LinuxPatchExtension
 if [ -d "$LOG_ROOT" ]; then
-    # newest 6 files, tail each
-    ls -1t "$LOG_ROOT"/*.log "$LOG_ROOT"/*.ext.log "$LOG_ROOT"/*.core.log 2>/dev/null \
-        | head -n 6 | while read -r f; do
+    # newest 6 files, tail each (deduplicate with awk to avoid *.log double-matching *.ext.log)
+    ls -1t "$LOG_ROOT"/*.log 2>/dev/null \
+        | awk '!seen[$0]++' | head -n 6 | while read -r f; do
             tail_file "$f" >> "$LOG"
         done
 else
@@ -252,12 +272,14 @@ case "$PKG_MGR" in
         dpkg --audit 2>&1 | head -n 40
         echo "---- Broken / half-installed packages ----"
         dpkg -l 2>/dev/null | awk "\$1 !~ /^ii/ && NR>5 {print}" | head -n 40
+        true
     '
     run_sh "APT - available upgrades (list only, no update)" '
         # "apt list --upgradable" reads the current cache; does NOT hit the net,
         # does NOT modify the cache. If cache is stale we simply see stale data,
         # which is exactly what we want to observe.
         LANG=C apt list --upgradable 2>/dev/null | head -n 200
+        true
     '
     run_sh "APT - history (last entries)" '
         for f in /var/log/apt/history.log /var/log/apt/history.log.1; do
@@ -272,6 +294,7 @@ case "$PKG_MGR" in
                  /var/log/unattended-upgrades/unattended-upgrades-dpkg.log; do
             [ -f "$f" ] && { echo "  == $f =="; tail -n 120 "$f"; }
         done
+        true
     '
     ;;
 
@@ -279,17 +302,20 @@ case "$PKG_MGR" in
     PM="$PKG_MGR"
     run_sh "$PM - repolist (uses cache only)" "
         LANG=C $PM -C repolist all 2>/dev/null | head -n 200
+        true
     "
     run_sh "$PM - check-update (cache-only, exit code informational)" "
         # -C forces cache-only mode: no network, no metadata refresh.
         LANG=C $PM -C check-update 2>/dev/null | head -n 200
         echo \"(exit code intentionally ignored - 100 means updates available)\"
+        true
     "
     run_sh "$PM - history (last entries)" "
         LANG=C $PM history 2>/dev/null | head -n 40
         echo '---- Last transaction detail ----'
         last_id=\$($PM history 2>/dev/null | awk '/^ *[0-9]+ / {print \$1; exit}')
         [ -n \"\$last_id\" ] && LANG=C $PM history info \"\$last_id\" 2>/dev/null | head -n 80
+        true
     "
     run_sh "$PM - repo files" '
         ls -la /etc/yum.repos.d/ 2>/dev/null
@@ -297,11 +323,13 @@ case "$PKG_MGR" in
             [ -f "$f" ] || continue
             echo "---- $f ----"; cat "$f"
         done
+        true
     '
     run_sh "RPM - broken package check" '
         rpm -Va --nofiles --nodigest 2>&1 | head -n 60
         echo "---- dnf/yum lock files ----"
         ls -la /var/run/dnf.pid /var/run/yum.pid /var/lib/rpm/.rpm.lock 2>/dev/null
+        true
     '
     ;;
 
@@ -309,13 +337,16 @@ case "$PKG_MGR" in
     run_sh "zypper - repos and locks" '
         LANG=C zypper --non-interactive lr -u 2>/dev/null | head -n 60
         LANG=C zypper --non-interactive ll 2>/dev/null | head -n 60
+        true
     '
     run_sh "zypper - patches/updates from cache (no refresh)" '
         LANG=C zypper --non-interactive --no-refresh lu 2>/dev/null | head -n 200
         LANG=C zypper --non-interactive --no-refresh lp 2>/dev/null | head -n 100
+        true
     '
     run_sh "zypper - history" '
         tail -n 200 /var/log/zypp/history 2>/dev/null
+        true
     '
     ;;
 
@@ -336,16 +367,28 @@ section "Reboot-required checks"
     fi
     if command -v needs-restarting >/dev/null 2>&1; then
         echo "---- needs-restarting -r ----"
-        needs-restarting -r 2>&1 | head -n 5
-        needs-restarting -r >/dev/null 2>&1
+        if command -v timeout >/dev/null 2>&1; then
+            out=$(timeout --preserve-status "${CMD_TIMEOUT}s" needs-restarting -r 2>&1)
+        else
+            out=$(needs-restarting -r 2>&1)
+        fi
         rc=$?
+        echo "$out" | head -n 5
         [ $rc -eq 1 ] && reboot_hits=$((reboot_hits+1))
     fi
     if command -v zypper >/dev/null 2>&1; then
-        zypper ps -s 2>/dev/null | head -n 40
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --preserve-status "${CMD_TIMEOUT}s" zypper ps -s 2>/dev/null | head -n 40
+        else
+            zypper ps -s 2>/dev/null | head -n 40
+        fi
     fi
     if command -v dnf >/dev/null 2>&1 && dnf help needs-restarting >/dev/null 2>&1; then
-        dnf needs-restarting 2>&1 | head -n 20
+        if command -v timeout >/dev/null 2>&1; then
+            timeout --preserve-status "${CMD_TIMEOUT}s" dnf needs-restarting 2>&1 | head -n 20
+        else
+            dnf needs-restarting 2>&1 | head -n 20
+        fi
     fi
     if [ $reboot_hits -gt 0 ]; then
         REBOOT_REQUIRED="yes"
@@ -367,6 +410,10 @@ log "Free MB: /=$FREE_MB_ROOT /var=$FREE_MB_VAR /boot=$FREE_MB_BOOT"
 if [ -n "$FREE_MB_ROOT" ] && [ "$FREE_MB_ROOT" -lt 1024 ]; then
     log "WARNING: / has less than 1 GB free" "WARN"; WARN_COUNT=$((WARN_COUNT+1))
 fi
+if [ -n "$FREE_MB_VAR" ] && [ "$FREE_MB_VAR" -lt 1024 ]; then
+    log "WARNING: /var has less than 1 GB free (package caches may fail)" "WARN"
+    WARN_COUNT=$((WARN_COUNT+1))
+fi
 if [ -n "$FREE_MB_BOOT" ] && [ "$FREE_MB_BOOT" -lt 200 ]; then
     log "WARNING: /boot has less than 200 MB free (kernel updates will fail)" "WARN"
     WARN_COUNT=$((WARN_COUNT+1))
@@ -376,15 +423,17 @@ fi
 run_sh "Connectivity - Azure/IMDS/repos (read-only probes)" "
     endpoints_common='169.254.169.254:80 management.azure.com:443 login.microsoftonline.com:443 packages.microsoft.com:443'
     endpoints_apt='archive.ubuntu.com:80 security.ubuntu.com:80 deb.debian.org:80 azure.archive.ubuntu.com:80'
-    endpoints_rh='cdn.redhat.com:443 rhui-1.microsoft.com:443 rhui-2.microsoft.com:443 rhui-3.microsoft.com:443'
+    endpoints_rh='cdn.redhat.com:443 rhui4-1.microsoft.com:443'
+    endpoints_suse='smt-azure.susecloud.net:443 update.suse.com:443'
     endpoints_all=\"\$endpoints_common\"
     case '$PKG_MGR' in
         apt) endpoints_all=\"\$endpoints_all \$endpoints_apt\" ;;
         dnf|yum) endpoints_all=\"\$endpoints_all \$endpoints_rh\" ;;
+        zypper) endpoints_all=\"\$endpoints_all \$endpoints_suse\" ;;
     esac
     for pair in \$endpoints_all; do
         host=\${pair%:*}; port=\${pair##*:}
-        # /dev/tcp is a bash builtin; fall back to nc/curl if unavailable
+        # /dev/tcp is a bash builtin accessible inside timeout's child bash
         if timeout ${NET_TIMEOUT}s bash -c \"echo > /dev/tcp/\$host/\$port\" 2>/dev/null; then
             printf '  %-45s TCP %-4s OK\n' \"\$host\" \"\$port\"
         else
@@ -397,6 +446,7 @@ run_sh "Connectivity - Azure/IMDS/repos (read-only probes)" "
     env | grep -iE '^(http|https|no)_proxy=' || echo '  (none set for current shell)'
     echo '---- default route ----'
     ip route 2>/dev/null | head -n 20
+    true
 "
 
 # ---- 10. sudoers sanity (Update extension needs to invoke sudo) ------------
@@ -406,6 +456,7 @@ run_sh "sudoers sanity for extension user (root)" '
     sudo -n -l 2>&1 | head -n 20
     echo "---- /etc/sudoers.d files present ----"
     ls -la /etc/sudoers.d/ 2>/dev/null
+    true
 '
 
 # ---- 11. Kernel / systemd state --------------------------------------------
@@ -418,6 +469,7 @@ run_sh "Systemd - failed units + auto-update timers" '
              dnf-automatic.timer dnf-automatic-install.timer packagekit.service; do
         systemctl is-enabled "$u" 2>/dev/null | awk -v u="$u" "{print u\": \"\$0}"
     done
+    true
 '
 
 run_sh "Kernel journal - errors from the last 24h" '
@@ -426,6 +478,7 @@ run_sh "Kernel journal - errors from the last 24h" '
     else
         echo "  journalctl not present"
     fi
+    true
 '
 
 # ---- 12. Patch settings via IMDS (guest patch mode) ------------------------
@@ -436,17 +489,35 @@ run_sh "Guest patch mode (IMDS)" "
             'http://169.254.169.254/metadata/instance/compute/osProfile?api-version=2021-12-13' \
             2>/dev/null | (python3 -m json.tool 2>/dev/null || cat)
     fi
+    true
 "
 
 # ---- Summary ---------------------------------------------------------------
 section "Summary"
+
+# Write summary content into the log (was previously empty)
+{
+    echo "Host             : $(hostname)"
+    echo "Version          : $SCRIPT_VERSION"
+    echo "Distro / pkg mgr : $DISTRO / $PKG_MGR"
+    echo "Started (UTC)    : $START_ISO"
+    echo "Finished (UTC)   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Log file         : $LOG"
+    echo "Reboot required  : $REBOOT_REQUIRED"
+    echo "Free MB /,/var,/boot : ${FREE_MB_ROOT:-?}, ${FREE_MB_VAR:-?}, ${FREE_MB_BOOT:-?}"
+    echo "VM Resource ID   : ${VM_RESOURCE_ID:-<IMDS unreachable>}"
+    echo "Warnings raised  : $WARN_COUNT"
+    echo "Errors           : $ERR_COUNT"
+} >> "$LOG"
+
 LOG_SIZE=$(stat -c '%s' "$LOG" 2>/dev/null || echo 0)
 LOG_KB=$(( LOG_SIZE / 1024 ))
 
 cat > "$JSON" <<JSON
 {
+  "script_version"    : "$SCRIPT_VERSION",
   "hostname"          : "$(hostname)",
-  "started_utc"       : "$TS",
+  "started_utc"       : "$START_ISO",
   "finished_utc"      : "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "distro"            : "$DISTRO",
   "package_manager"   : "$PKG_MGR",
@@ -464,9 +535,10 @@ JSON
 
 cat <<EOF
 === Azure Update Manager diag (Linux) ===
+Version          : $SCRIPT_VERSION
 Host             : $(hostname)
 Distro / pkg mgr : $DISTRO / $PKG_MGR
-Started (UTC)    : $TS
+Started (UTC)    : $START_ISO
 Finished (UTC)   : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 Log file         : $LOG  (${LOG_KB} KB)
 Summary JSON     : $JSON
@@ -474,8 +546,13 @@ Reboot required  : $REBOOT_REQUIRED
 Free MB /,/var,/boot : ${FREE_MB_ROOT:-?}, ${FREE_MB_VAR:-?}, ${FREE_MB_BOOT:-?}
 VM Resource ID   : ${VM_RESOURCE_ID:-<IMDS unreachable>}
 Warnings raised  : $WARN_COUNT
+Errors           : $ERR_COUNT
 
-Retrieve the full log with, for example:
-  az vm run-command invoke -g <rg> -n <vm> --command-id RunShellScript \\
-    --scripts "cat $LOG"
+Retrieve the full log from your local PowerShell (Az module):
+  Invoke-AzVMRunCommand -ResourceGroupName <rg> -VMName <vm> `
+    -CommandId RunShellScript -ScriptString "cat $LOG"
+
+Note: Run Command truncates stdout to ~4 KB. For logs larger than ~4 KB
+(virtually all real logs), see the "Retrieving large logs" section in the
+README for a working chunked-base64 download pattern.
 EOF

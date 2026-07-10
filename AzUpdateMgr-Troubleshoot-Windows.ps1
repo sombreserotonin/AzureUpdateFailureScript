@@ -16,7 +16,7 @@
         broken component cannot abort the run.
 
 .NOTES
-    Author         : Generated diagnostic
+    Version        : 1.0.0
     Target         : Windows Server 2016/2019/2022/2025, Windows 10/11 Azure VMs
     Privilege      : Run Command executes as SYSTEM, which is what we need.
     Idempotent     : Yes. Safe to run repeatedly.
@@ -33,6 +33,7 @@ param(
 )
 
 # --- Bootstrap ---------------------------------------------------------------
+$ScriptVersion = '1.0.0'
 $ErrorActionPreference = 'Continue'    # never let one failure kill the script
 $ProgressPreference    = 'SilentlyContinue'
 $startedUtc            = (Get-Date).ToUniversalTime()
@@ -41,10 +42,10 @@ $outDir                = 'C:\Windows\Temp'
 $logPath               = Join-Path $outDir "AzUpdateMgr-Diag-$stamp.log"
 $jsonPath              = Join-Path $outDir "AzUpdateMgr-Diag-$stamp-summary.json"
 $summary               = [ordered]@{
+    ScriptVersion      = $ScriptVersion
     StartedUtc         = $startedUtc.ToString('o')
     Hostname           = $env:COMPUTERNAME
     LogPath            = $logPath
-    Findings           = New-Object System.Collections.Generic.List[object]
     Warnings           = New-Object System.Collections.Generic.List[string]
     Errors             = New-Object System.Collections.Generic.List[string]
 }
@@ -80,13 +81,19 @@ function Invoke-Safe {
         # the host buffer (~120 chars), which silently dropped column data.
         $out = & $Script *>&1
         if ($null -ne $out) {
+            # Count non-terminating error records that were merged into the
+            # output stream so the summary's error count reflects reality.
+            $errCount = ($out | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }).Count
+            if ($errCount -gt 0) {
+                $summary.Errors.Add("$errCount non-terminating error(s) in section '$Name'")
+            }
             $text = ($out | Out-String -Width 4096).TrimEnd()
             if ($text) { Add-Content -LiteralPath $logPath -Value $text -Encoding UTF8 }
         }
     } catch {
         $msg = "ERROR in '$Name': $($_.Exception.Message)"
         Write-Log $msg 'ERROR'
-        $summary.Errors.Add($msg) | Out-Null
+        $summary.Errors.Add($msg)
     }
     Write-Log "END:   $Name"
 }
@@ -114,6 +121,7 @@ function Get-TailFile {
 
 # --- Header ------------------------------------------------------------------
 Write-Section 'Azure Update Manager - Windows diagnostic'
+Write-Log "Script version: $ScriptVersion"
 Write-Log ("Script started {0} UTC on {1}" -f $startedUtc, $env:COMPUTERNAME)
 Write-Log  "Read-only mode. No changes will be made to this VM."
 
@@ -152,11 +160,14 @@ Invoke-Safe 'Azure VM Guest Agent' {
     Get-Service -Name $svcs -ErrorAction SilentlyContinue |
         Select-Object Name, DisplayName, Status, StartType | Format-Table -AutoSize
 
-    $agentDir = 'C:\WindowsAzure\Packages'
-    if (Test-Path $agentDir) {
-        Get-ChildItem $agentDir -Filter 'GuestAgent_*' -Directory -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 3 Name, LastWriteTime | Format-Table -AutoSize
+    # Search both well-known locations for guest agent version folders.
+    $agentDirs = @('C:\WindowsAzure', 'C:\WindowsAzure\Packages')
+    foreach ($agentDir in $agentDirs) {
+        if (Test-Path $agentDir) {
+            Get-ChildItem $agentDir -Filter 'GuestAgent_*' -Directory -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 3 Name, LastWriteTime | Format-Table -AutoSize
+        }
     }
 
     $aggregate = 'C:\WindowsAzure\Logs\AggregateStatus'
@@ -314,11 +325,17 @@ Invoke-Safe 'Last successful update detection' {
 
 # 5d. WSUS web service health (supplements the Test-NetConnection checks) ------
 Invoke-Safe 'WSUS web service health (ClientWebService)' {
-    if (-not $summary.WsusConfigured -or [string]::IsNullOrWhiteSpace($summary.WsusServer)) {
+    # Re-read WSUS values locally to avoid a hidden dependency on section 5a's
+    # $summary fields (defensive — ensures this section is self-contained).
+    $wsusServerLocal    = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate'    -Name WUServer    -ErrorAction SilentlyContinue).WUServer
+    $useWUServerLocal   = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' -Name UseWUServer -ErrorAction SilentlyContinue).UseWUServer
+    $wsusConfiguredLocal = ($useWUServerLocal -eq 1) -and -not [string]::IsNullOrWhiteSpace($wsusServerLocal)
+
+    if (-not $wsusConfiguredLocal -or [string]::IsNullOrWhiteSpace($wsusServerLocal)) {
         "  <WSUS not configured - skipping web service check>"
         return
     }
-    $wsusUri = "$($summary.WsusServer.TrimEnd('/'))/ClientWebService/client.asmx"
+    $wsusUri = "$($wsusServerLocal.TrimEnd('/'))/ClientWebService/client.asmx"
     "Testing HTTP reachability of: $wsusUri"
 
     $result = [ordered]@{
@@ -388,7 +405,7 @@ Invoke-Safe 'Windows Update client (recent history via COM, read-only)' {
                 }
             }
             $failed = $rows | Where-Object { $_.ResultCode -in 'Failed','SucceededWithErrors','Aborted' }
-            $summary.RecentUpdateFailures = $failed | Select-Object -First 10
+            $summary.RecentUpdateFailures = @($failed | Select-Object -First 10)
             $rows | Format-Table -AutoSize -Wrap
         }
     } catch {
@@ -605,7 +622,7 @@ Invoke-Safe 'System event log - recent Windows Update / servicing errors' {
         try {
             Get-WinEvent -FilterHashtable @{ LogName='System'; ProviderName=$p } `
                 -MaxEvents $EventCount -ErrorAction Stop |
-                Where-Object { $_.LevelDisplayName -in 'Error','Warning' -or $_.Id -in 19,20,43,44 } |
+                Where-Object { $_.Level -in 1,2,3 -or $_.Id -in 19,20,43,44 } |
                 Select-Object TimeCreated, Id, LevelDisplayName, Message |
                 Format-List
         } catch {
@@ -617,7 +634,7 @@ Invoke-Safe 'System event log - recent Windows Update / servicing errors' {
 Invoke-Safe 'Setup log - recent CBS/servicing failures' {
     try {
         Get-WinEvent -LogName Setup -MaxEvents $EventCount -ErrorAction Stop |
-            Where-Object { $_.LevelDisplayName -in 'Error','Warning' } |
+            Where-Object { $_.Level -in 1,2,3 } |
             Select-Object TimeCreated, Id, LevelDisplayName, Message |
             Format-List
     } catch { "  (no Setup events readable)" }
@@ -644,7 +661,8 @@ Invoke-Safe 'Guest patch settings (from IMDS)' {
 Write-Section 'Summary'
 $summary.FinishedUtc = (Get-Date).ToUniversalTime().ToString('o')
 $summaryJsonText = $summary | ConvertTo-Json -Depth 6
-$summaryJsonText | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+# Write BOM-less UTF-8 to avoid tripping strict JSON parsers.
+[System.IO.File]::WriteAllText($jsonPath, $summaryJsonText, (New-Object System.Text.UTF8Encoding($false)))
 # Mirror the summary into the log file too - previously the 'Summary' section
 # header was written but no content ever followed it in the log.
 Add-Content -LiteralPath $logPath -Value $summaryJsonText -Encoding UTF8
@@ -672,6 +690,7 @@ $fetchJson = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (I
 
 $compact = @"
 === Azure Update Manager diag (Windows) ===
+Version          : $ScriptVersion
 Host             : $env:COMPUTERNAME
 Started (UTC)    : $($startedUtc.ToString('s'))Z
 Finished (UTC)   : $($summary.FinishedUtc)
@@ -698,7 +717,8 @@ $fetchLog
 # Summary JSON:
 $fetchJson
 
-Note: Run Command truncates stdout to ~4 KB per invocation. If the log is
-larger, use the base64-chunked download pattern instead of Get-Content -Raw.
+Note: Run Command truncates stdout to ~4 KB per invocation. For logs
+larger than ~4 KB (virtually all real logs), see the "Retrieving large
+logs" section in the README for a working chunked-base64 download pattern.
 "@
 Write-Output $compact
