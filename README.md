@@ -138,25 +138,67 @@ This avoids the 4 KB limit entirely. Remove the command after retrieval with `Re
 
 ### Option B — Chunked base64 download
 
-Use this ready-to-paste Az PowerShell loop to download logs of any size via chunked base64 encoding. Adjust `$remotePath` to the on-VM log path:
+Retrieve logs of any size by reading them in 2 KB chunks, base64-encoding each chunk
+on the VM, and reassembling locally. Replace `<resource-group>`, `<vm-name>`, and the
+`$remotePath` with your actual values.
+
+#### Windows VM
 
 ```powershell
-# Chunked log retrieval (works with any log size)
-$rg   = '<resource-group>'
-$vm   = '<vm-name>'
-$remotePath = '/var/log/azupdatemgr-diag-*.log'   # or C:\Windows\Temp\AzUpdateMgr-Diag-*.log
+$rg         = '<resource-group>'
+$vm         = '<vm-name>'
+$remotePath = 'C:\Windows\Temp\AzUpdateMgr-Diag-*.log'
 $localPath  = '.\retrieved-diag.log'
 
-# Get the raw bytes as base64-chunked transfer
-$script = @"
-[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((Get-Content -Raw '$remotePath')))
-"@
-$result = Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vm `
-  -CommandId (if ($remotePath -like '/*') {'RunShellScript'} else {'RunPowerShellScript'}) `
-  -ScriptString $script
+# Resolve the exact log path (wildcard → newest match)
+$resolveScript = "\$f = Get-ChildItem '$remotePath' | Sort-Object LastWriteTime -Descending | Select-Object -First 1; if (\$f) { \$f.FullName } else { Write-Error 'No log found' }"
+$logPath = ((Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vm `
+  -CommandId RunPowerShellScript -ScriptString $resolveScript).Value[0].Message -split '\r?\n' |
+  Where-Object { $_ -notmatch '^\[' } | Select-Object -Last 1).Trim()
 
-$b64 = ($result.Value[0].Message -split '\r?\n' | Where-Object { $_ -notmatch '^\[stdout\]' -and $_ -notmatch '^Enable succeeded' -and $_ }) -join ''
-[System.IO.File]::WriteAllBytes($localPath, [Convert]::FromBase64String($b64))
+# Chunky download: read 2048 bytes per call, base64 each, reassemble
+[System.IO.File]::WriteAllBytes($localPath, [byte[]]@())
+$offset = 0; $chunkSize = 2048
+do {
+    $chunkScript = "[Convert]::ToBase64String([System.IO.File]::ReadAllBytes('$logPath')[$offset..($offset+$chunkSize-1)])"
+    $b64 = ((Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vm `
+      -CommandId RunPowerShellScript -ScriptString $chunkScript).Value[0].Message -split '\r?\n' |
+      Where-Object { $_ -notmatch '^\[stdout\]' -and $_ -notmatch '^Enable succeeded' -and $_ }) -join ''
+    if ($b64) {
+        [System.IO.File]::AppendAllBytes($localPath, [Convert]::FromBase64String($b64))
+        $offset += $chunkSize
+    }
+} while ($b64)
+Write-Output "Log saved to: $localPath"
+```
+
+#### Linux VM
+
+```powershell
+$rg         = '<resource-group>'
+$vm         = '<vm-name>'
+$remotePath = '/var/log/azupdatemgr-diag-*.log'
+$localPath  = '.\retrieved-diag.log'
+
+# Resolve the exact log path
+$resolveScript = "LS=( $remotePath ); [ -f \"\${LS[0]}\" ] && echo \"\${LS[0]}\" || echo ''"
+$logPath = ((Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vm `
+  -CommandId RunShellScript -ScriptString $resolveScript).Value[0].Message -split '\r?\n' |
+  Where-Object { $_ -notmatch '^\[' -and $_ -ne '' } | Select-Object -First 1).Trim()
+
+# Chunky download: read 2048 bytes per call, base64 each, reassemble
+[System.IO.File]::WriteAllBytes($localPath, [byte[]]@())
+$offset = 0; $chunkSize = 2048
+do {
+    $chunkScript = "dd if='$logPath' bs=1 skip=$offset count=$chunkSize 2>/dev/null | base64 -w0"
+    $b64 = ((Invoke-AzVMRunCommand -ResourceGroupName $rg -VMName $vm `
+      -CommandId RunShellScript -ScriptString $chunkScript).Value[0].Message -split '\r?\n' |
+      Where-Object { $_ -notmatch '^\[stdout\]' -and $_ -notmatch '^Enable succeeded' -and $_ }) -join ''
+    if ($b64) {
+        [System.IO.File]::AppendAllBytes($localPath, [Convert]::FromBase64String($b64))
+        $offset += $chunkSize
+    }
+} while ($b64)
 Write-Output "Log saved to: $localPath"
 ```
 

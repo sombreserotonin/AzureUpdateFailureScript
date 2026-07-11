@@ -65,10 +65,15 @@ run_safe() {
         rc=$?
     fi
     if [ $rc -ne 0 ]; then
-        log "END:   $title (rc=$rc)" "WARN"
+        # 124 = timeout(1) killed the command, rc=128+SIGTERM=143 or
+        # 128+SIGKILL=137 from --preserve-status. These are hangs, not failures.
+        case $rc in
+            124|137|143) log "END:   $title (rc=$rc TIMEOUT)" "WARN" ;;
+            126|127)     log "END:   $title (rc=$rc exec failure)" "ERROR"
+                         ERR_COUNT=$((ERR_COUNT+1)) ;;
+            *)           log "END:   $title (rc=$rc)" "WARN" ;;
+        esac
         WARN_COUNT=$((WARN_COUNT+1))
-        # rc >= 126 is a command-not-found / exec failure — treat as error
-        if [ $rc -ge 126 ]; then ERR_COUNT=$((ERR_COUNT+1)); fi
     else
         log "END:   $title"
     fi
@@ -89,10 +94,15 @@ run_sh() {
         rc=$?
     fi
     if [ $rc -ne 0 ]; then
-        log "END:   $title (rc=$rc)" "WARN"
+        # 124 = timeout(1) killed the command, rc=128+SIGTERM=143 or
+        # 128+SIGKILL=137 from --preserve-status. These are hangs, not failures.
+        case $rc in
+            124|137|143) log "END:   $title (rc=$rc TIMEOUT)" "WARN" ;;
+            126|127)     log "END:   $title (rc=$rc exec failure)" "ERROR"
+                         ERR_COUNT=$((ERR_COUNT+1)) ;;
+            *)           log "END:   $title (rc=$rc)" "WARN" ;;
+        esac
         WARN_COUNT=$((WARN_COUNT+1))
-        # rc >= 126 is a command-not-found / exec failure — treat as error
-        if [ $rc -ge 126 ]; then ERR_COUNT=$((ERR_COUNT+1)); fi
     else
         log "END:   $title"
     fi
@@ -113,6 +123,9 @@ tail_file() {
 }
 
 # ---- header -----------------------------------------------------------------
+# Restrictive umask so diagnostic files are not world-readable (they may
+# contain proxy credentials, repo configs, and system paths).
+umask 077
 mkdir -p "$OUT_DIR" 2>/dev/null || true
 : > "$LOG"
 section "Azure Update Manager - Linux diagnostic"
@@ -166,10 +179,15 @@ run_sh "Azure Instance Metadata (IMDS)" "
 
 VM_RESOURCE_ID=""
 if command -v curl >/dev/null 2>&1; then
-    VM_RESOURCE_ID=$(curl -sS --max-time "$NET_TIMEOUT" --noproxy '*' \
+    # -f: fail on HTTP errors so error bodies don't leak into the JSON summary
+    raw_id=$(curl -sSf --max-time "$NET_TIMEOUT" --noproxy '*' \
         -H 'Metadata: true' \
         'http://169.254.169.254/metadata/instance/compute/resourceId?api-version=2021-12-13&format=text' \
-        2>/dev/null)
+        2>/dev/null) || raw_id=""
+    # Only accept the value if it looks like a valid Azure resource ID
+    case "$raw_id" in
+        /subscriptions/*) VM_RESOURCE_ID="$raw_id" ;;
+    esac
 fi
 
 # ---- 3. Azure VM / Arc agent ------------------------------------------------
@@ -360,12 +378,15 @@ esac
 section "Reboot-required checks"
 {
     reboot_hits=0
+    any_detector_ran=0
     if [ -f /var/run/reboot-required ]; then
         echo "  /var/run/reboot-required present"
         [ -f /var/run/reboot-required.pkgs ] && cat /var/run/reboot-required.pkgs | sed 's/^/    /'
         reboot_hits=$((reboot_hits+1))
+        any_detector_ran=1
     fi
     if command -v needs-restarting >/dev/null 2>&1; then
+        any_detector_ran=1
         echo "---- needs-restarting -r ----"
         if command -v timeout >/dev/null 2>&1; then
             out=$(timeout --preserve-status "${CMD_TIMEOUT}s" needs-restarting -r 2>&1)
@@ -374,9 +395,35 @@ section "Reboot-required checks"
         fi
         rc=$?
         echo "$out" | head -n 5
-        [ $rc -eq 1 ] && reboot_hits=$((reboot_hits+1))
+        # Exit code 1 = reboot required, 0 = no reboot needed (yum-utils / dnf-utils)
+        if [ $rc -eq 1 ]; then
+            echo "  needs-restarting -r returned exit code 1 (reboot required)"
+            reboot_hits=$((reboot_hits+1))
+        elif [ $rc -gt 127 ]; then
+            echo "  needs-restarting -r killed/timed out (rc=$rc) - reboot status unknown"
+            # Do not count as a reliable detector run
+            any_detector_ran=$((any_detector_ran - 1))
+        fi
     fi
+    # zypper needs-rebooting: supported SLES read-only reboot check (rc 102 = reboot suggested)
     if command -v zypper >/dev/null 2>&1; then
+        any_detector_ran=1
+        echo "---- zypper needs-rebooting ----"
+        if command -v timeout >/dev/null 2>&1; then
+            out=$(timeout --preserve-status "${CMD_TIMEOUT}s" zypper needs-rebooting 2>&1)
+        else
+            out=$(zypper needs-rebooting 2>&1)
+        fi
+        zr_rc=$?
+        echo "$out" | head -n 10
+        if [ $zr_rc -eq 102 ]; then
+            echo "  zypper needs-rebooting returned exit code 102 (reboot suggested)"
+            reboot_hits=$((reboot_hits+1))
+        elif [ $zr_rc -gt 127 ]; then
+            echo "  zypper needs-rebooting killed/timed out (rc=$zr_rc) - reboot status unknown"
+            any_detector_ran=$((any_detector_ran - 1))
+        fi
+        echo "---- zypper ps -s (processes using old files - informational) ----"
         if command -v timeout >/dev/null 2>&1; then
             timeout --preserve-status "${CMD_TIMEOUT}s" zypper ps -s 2>/dev/null | head -n 40
         else
@@ -384,16 +431,29 @@ section "Reboot-required checks"
         fi
     fi
     if command -v dnf >/dev/null 2>&1 && dnf help needs-restarting >/dev/null 2>&1; then
+        any_detector_ran=1
+        echo "---- dnf needs-restarting ----"
         if command -v timeout >/dev/null 2>&1; then
-            timeout --preserve-status "${CMD_TIMEOUT}s" dnf needs-restarting 2>&1 | head -n 20
+            out=$(timeout --preserve-status "${CMD_TIMEOUT}s" dnf needs-restarting 2>&1)
         else
-            dnf needs-restarting 2>&1 | head -n 20
+            out=$(dnf needs-restarting 2>&1)
+        fi
+        dnf_rc=$?
+        echo "$out" | head -n 20
+        if [ $dnf_rc -eq 1 ]; then
+            echo "  dnf needs-restarting returned exit code 1 (reboot recommended)"
+            reboot_hits=$((reboot_hits+1))
+        elif [ $dnf_rc -gt 127 ]; then
+            echo "  dnf needs-restarting killed/timed out (rc=$dnf_rc) - reboot status unknown"
+            any_detector_ran=$((any_detector_ran - 1))
         fi
     fi
     if [ $reboot_hits -gt 0 ]; then
         REBOOT_REQUIRED="yes"
-    else
+    elif [ $any_detector_ran -gt 0 ]; then
         REBOOT_REQUIRED="no"
+    else
+        REBOOT_REQUIRED="unknown"
     fi
     echo "  REBOOT_REQUIRED=$REBOOT_REQUIRED"
 } >> "$LOG" 2>&1
@@ -431,10 +491,15 @@ run_sh "Connectivity - Azure/IMDS/repos (read-only probes)" "
         dnf|yum) endpoints_all=\"\$endpoints_all \$endpoints_rh\" ;;
         zypper) endpoints_all=\"\$endpoints_all \$endpoints_suse\" ;;
     esac
+    # Probe helper: honor the script's degradation policy (timeout optional)
+    if command -v timeout >/dev/null 2>&1; then
+        probe() { timeout ${NET_TIMEOUT}s bash -c \"echo > /dev/tcp/\$1/\$2\" 2>/dev/null; }
+    else
+        probe() { bash -c \"echo > /dev/tcp/\$1/\$2\" 2>/dev/null; }
+    fi
     for pair in \$endpoints_all; do
         host=\${pair%:*}; port=\${pair##*:}
-        # /dev/tcp is a bash builtin accessible inside timeout's child bash
-        if timeout ${NET_TIMEOUT}s bash -c \"echo > /dev/tcp/\$host/\$port\" 2>/dev/null; then
+        if probe \"\$host\" \"\$port\"; then
             printf '  %-45s TCP %-4s OK\n' \"\$host\" \"\$port\"
         else
             printf '  %-45s TCP %-4s FAIL\n' \"\$host\" \"\$port\"
@@ -532,6 +597,7 @@ cat > "$JSON" <<JSON
   "log_size_bytes"    : $LOG_SIZE
 }
 JSON
+chmod 600 "$JSON" 2>/dev/null || true
 
 cat <<EOF
 === Azure Update Manager diag (Linux) ===

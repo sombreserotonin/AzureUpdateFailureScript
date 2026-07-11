@@ -304,8 +304,8 @@ Invoke-Safe 'WSUS client registration (SusClientId)' {
 
     $summary.SusClientId = $susClientId
     $summary.PingID      = $pingId
-    if ([string]::IsNullOrWhiteSpace($susClientId)) {
-        $summary.Warnings.Add('SusClientId is missing or empty - this client may not be registered with WSUS.') | Out-Null
+    if ([string]::IsNullOrWhiteSpace($susClientId) -and $wsusConfigured) {
+        $summary.Warnings.Add('SusClientId is missing or empty - this WSUS-configured client may not be registered.') | Out-Null
     }
 }
 
@@ -576,10 +576,33 @@ Invoke-Safe 'Connectivity to update endpoints (TCP 443, DNS only)' {
         'login.microsoftonline.com',
         'guestnotificationservice.azure.com'
     )
+
+    # Read-only TCP connect probe with explicit timeout (honors PerCommandTimeoutSec).
+    # Replaces Test-NetConnection which has no built-in timeout and can stall
+    # for the full TCP stack timeout (~21 s each) on blackholed endpoints.
+    function Test-TcpPort {
+        param([string]$ComputerName, [int]$Port, [int]$TimeoutMs)
+        try {
+            $client = New-Object System.Net.Sockets.TcpClient
+            $async  = $client.BeginConnect($ComputerName, $Port, $null, $null)
+            if ($async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+                $client.EndConnect($async)
+                $client.Close()
+                return $true
+            } else {
+                $client.Close()
+                return $false
+            }
+        } catch {
+            return $false
+        }
+    }
+
+    $timeoutMs = $PerCommandTimeoutSec * 1000
     $endpoints | ForEach-Object {
         $e = $_
         try {
-            $t = Test-NetConnection -ComputerName $e -Port 443 -InformationLevel Quiet -WarningAction SilentlyContinue
+            $t = Test-TcpPort -ComputerName $e -Port 443 -TimeoutMs $timeoutMs
             [pscustomobject]@{ Endpoint = $e; TCP443 = $t }
         } catch {
             [pscustomobject]@{ Endpoint = $e; TCP443 = "err: $($_.Exception.Message)" }
@@ -685,8 +708,8 @@ $localJson    = "C:\Temp\$jsonLeaf"
 $q = [char]34   # literal double-quote, keeps this line free of escaping headaches
 # The one-liners create C:\Temp on the LOCAL PC first (Set-Content does not
 # auto-create parent directories), then invoke Run Command and save the output.
-$fetchLog  = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$logPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localLog' -Encoding UTF8"
-$fetchJson = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -Name '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$jsonPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localJson' -Encoding UTF8"
+$fetchLog  = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -VMName '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$logPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localLog' -Encoding UTF8"
+$fetchJson = "New-Item -ItemType Directory -Force -Path 'C:\Temp' | Out-Null; (Invoke-AzVMRunCommand -ResourceGroupName '$rgForCmd' -VMName '$vmNameForCmd' -CommandId 'RunPowerShellScript' -ScriptString $($q)Get-Content -Raw '$jsonPath'$($q)).Value[0].Message | Set-Content -LiteralPath '$localJson' -Encoding UTF8"
 
 $compact = @"
 === Azure Update Manager diag (Windows) ===
