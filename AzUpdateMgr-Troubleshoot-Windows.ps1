@@ -680,6 +680,19 @@ Invoke-Safe 'Guest patch settings (from IMDS)' {
     }
 }
 
+Invoke-Safe 'Host Memory Usage' {
+    try {
+        Get-CimInstance -ClassName Win32_OperatingSystem | Select-Object `
+            @{Name='TotalPhysicalMemory(GB)'; Expression = {[math]::round($_.TotalVisibleMemorySize / 1MB, 2)}},
+            @{Name='FreePhysicalMemory(GB)'; Expression = {[math]::round($_.FreePhysicalMemory / 1MB, 2)}},
+            @{Name='TotalPageFile(GB)'; Expression = {[math]::round($_.TotalVirtualMemorySize / 1MB, 2)}},
+            @{Name='FreePageFile(GB)'; Expression = {[math]::round($_.FreeVirtualMemory / 1MB, 2)}}
+    }catch{
+        "Unable to retrieve host memory usage: $($_.Exception.Message)"
+    }
+}
+
+
 # --- Summary block -----------------------------------------------------------
 Write-Section 'Summary'
 $summary.FinishedUtc = (Get-Date).ToUniversalTime().ToString('o')
