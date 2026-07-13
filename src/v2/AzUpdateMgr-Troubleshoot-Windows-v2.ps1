@@ -54,9 +54,9 @@ foreach ($contributor in $contributors){
 
 if ($isContributor -eq $true){
         Write-Host "Confirmed account has appropriate permissions to run script on host.`n"
-        exit 1
     }else{
         Write-Host "Error: Account does not have permissions to run diagnostic script on host. Please PIM up to Contributor permissions for VM.`n"
+        exit 1
     }
 
 Write-Host "==== Running Script on Host ===="
