@@ -9,9 +9,9 @@
 Import-Module Az.Compute
 
 # ==== PARAMS ====
-$subscriptionId = "97f3768f-9c10-476a-973b-fcadf178d70a"
-$resourceGroupName = "clustri-ae-rg"
-$vmName = "clustri-test"
+$subscriptionId = "bdb10c9b-53ed-4281-860e-3fab0adb7008"
+$resourceGroupName = "cgl-ae-dc01_group"
+$vmName = "cgl-ae-dc02"
 
 $scriptPath = "./AzUpdateMgr-HostScript-Windows.ps1"
 
@@ -69,5 +69,4 @@ try{
     exit 1
 }
 
-$resultOut = $result.Value.Message
-Write-Host ($resultOut | ConvertFrom-Json)
+$resultOut = ($result.Value.Message | ConvertFrom-Json)
